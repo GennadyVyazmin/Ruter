@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Universal sing-box policy-routing gateway manager.
 # Clean Ruter installation layout.
 
-RUTER_VERSION="2.0.0"
+RUTER_VERSION="2.0.1"
 
 APP_DIR="/etc/ruter"
 SETTINGS_FILE="$APP_DIR/settings.env"
@@ -723,6 +723,13 @@ set -Eeuo pipefail
 SETTINGS_FILE="/etc/ruter/settings.env"
 SINGBOX_CONFIG="/etc/sing-box/config.json"
 
+error_handler() {
+  local exit_code=$?
+  echo "Ruter route error: line ${BASH_LINENO[0]}, command: ${BASH_COMMAND}, exit: ${exit_code}" >&2
+  exit "$exit_code"
+}
+trap error_handler ERR
+
 # shellcheck disable=SC1090
 source "$SETTINGS_FILE"
 
@@ -732,12 +739,43 @@ SELF_RULE_PRIORITY="${SELF_RULE_PRIORITY:-90}"
 ROUTE_MODE="${ROUTE_MODE:-sources}"
 ROUTE_SOURCES="${ROUTE_SOURCES:-${ROUTE_SOURCE:-}}"
 
+require_value() {
+  local name="$1"
+  local value="${!name:-}"
+  if [ -z "$value" ]; then
+    echo "Missing required setting: $name" >&2
+    exit 2
+  fi
+}
+
+validate_ipv4() {
+  python3 - "$1" <<'PY'
+import ipaddress
+import sys
+try:
+    ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+PY
+}
+
+validate_network() {
+  python3 - "$1" <<'PY'
+import ipaddress
+import sys
+try:
+    ipaddress.ip_network(sys.argv[1], strict=False)
+except ValueError:
+    raise SystemExit(1)
+PY
+}
+
 cleanup_rules() {
   local priority
   for ((priority=RULE_PRIORITY; priority<=RULE_PRIORITY+255; priority++)); do
-    while ip rule del priority "$priority" 2>/dev/null; do :; done
+    while ip -4 rule del priority "$priority" 2>/dev/null; do :; done
   done
-  while ip rule del priority "$SELF_RULE_PRIORITY" 2>/dev/null; do :; done
+  while ip -4 rule del priority "$SELF_RULE_PRIORITY" 2>/dev/null; do :; done
 }
 
 wait_interface() {
@@ -746,27 +784,63 @@ wait_interface() {
   local i
 
   for ((i=1; i<=tries; i++)); do
-    ip link show "$iface" >/dev/null 2>&1 && return 0
+    if ip link show dev "$iface" >/dev/null 2>&1; then
+      return 0
+    fi
     sleep 1
   done
 
-  echo "Interface not found: $iface" >&2
+  echo "Interface not found after ${tries}s: $iface" >&2
   return 1
 }
+
+require_value LAN_IFACE
+require_value LAN_GATEWAY
+require_value VM_IP
+require_value LAN_CIDR
+require_value TUN_IFACE
+
+VM_IP="${VM_IP%%/*}"
+
+validate_ipv4 "$VM_IP" || {
+  echo "Invalid VM_IP: $VM_IP" >&2
+  exit 2
+}
+validate_ipv4 "$LAN_GATEWAY" || {
+  echo "Invalid LAN_GATEWAY: $LAN_GATEWAY" >&2
+  exit 2
+}
+validate_network "$LAN_CIDR" || {
+  echo "Invalid LAN_CIDR: $LAN_CIDR" >&2
+  exit 2
+}
+
+case "$ROUTE_MODE" in
+  sources|lan|disabled) ;;
+  *)
+    echo "Invalid ROUTE_MODE: $ROUTE_MODE" >&2
+    exit 2
+    ;;
+esac
+
+if [ "$ROUTE_MODE" != "disabled" ] && [ -z "$ROUTE_SOURCES" ]; then
+  echo "ROUTE_SOURCES is empty for enabled routing" >&2
+  exit 2
+fi
 
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 wait_interface "$LAN_IFACE"
 
 cleanup_rules
-ip route flush table "$TABLE_ID" 2>/dev/null || true
+ip -4 route flush table "$TABLE_ID" 2>/dev/null || true
 nft delete table ip ruter_nat 2>/dev/null || true
 
-# The gateway VM itself must always use the main table.
-ip rule add \
+# Gateway VM always bypasses the VPN routing table.
+ip -4 rule add \
+  priority "$SELF_RULE_PRIORITY" \
   from "$VM_IP/32" \
-  lookup main \
-  priority "$SELF_RULE_PRIORITY"
+  lookup main
 
 if [ "$ROUTE_MODE" = "disabled" ]; then
   echo "Ruter routing is disabled"
@@ -775,56 +849,88 @@ fi
 
 wait_interface "$TUN_IFACE"
 
-ip route replace "$LAN_CIDR" dev "$LAN_IFACE" table "$TABLE_ID"
+# Keep the local LAN reachable from the policy-routing table.
+ip -4 route replace \
+  "$LAN_CIDR" \
+  dev "$LAN_IFACE" \
+  scope link \
+  table "$TABLE_ID"
 
-# VPS IP addresses must bypass TUN to avoid a routing loop.
+# VPN server addresses must bypass TUN to prevent a routing loop.
 if [ -f "$SINGBOX_CONFIG" ]; then
-  python3 - "$LAN_GATEWAY" "$LAN_IFACE" "$TABLE_ID" "$SINGBOX_CONFIG" <<'PY' |
-    while IFS= read -r command; do
-      [ -n "$command" ] && sh -c "$command"
-    done
+  while IFS= read -r server_ip; do
+    [ -n "$server_ip" ] || continue
+    ip -4 route replace \
+      "$server_ip/32" \
+      via "$LAN_GATEWAY" \
+      dev "$LAN_IFACE" \
+      table "$TABLE_ID"
+  done < <(
+    python3 - "$SINGBOX_CONFIG" <<'PY'
+import ipaddress
 import json
 import sys
 
-gateway, interface, table, config_path = sys.argv[1:]
-config = json.load(open(config_path, encoding="utf-8"))
-ips = set()
+with open(sys.argv[1], encoding="utf-8") as fh:
+    config = json.load(fh)
+
+addresses = set()
+
+for outbound in config.get("outbounds", []):
+    server = outbound.get("server")
+    if not server:
+        continue
+    try:
+        addresses.add(str(ipaddress.ip_address(server)))
+    except ValueError:
+        pass
 
 for rule in config.get("route", {}).get("rules", []):
     for item in rule.get("ip_cidr", []) or []:
-        if item.endswith("/32"):
-            ips.add(item)
+        try:
+            network = ipaddress.ip_network(item, strict=False)
+        except ValueError:
+            continue
+        if network.version == 4 and network.prefixlen == 32:
+            addresses.add(str(network.network_address))
 
-for item in sorted(ips):
-    print(
-        f"ip route replace {item} via {gateway} "
-        f"dev {interface} table {table}"
-    )
+for address in sorted(addresses):
+    print(address)
 PY
+  )
 fi
 
-ip route replace default dev "$TUN_IFACE" table "$TABLE_ID"
+ip -4 route replace \
+  default \
+  dev "$TUN_IFACE" \
+  table "$TABLE_ID"
 
 priority="$RULE_PRIORITY"
 for source in $ROUTE_SOURCES; do
-  ip rule add \
+  validate_network "$source" || {
+    echo "Invalid route source: $source" >&2
+    exit 2
+  }
+
+  ip -4 rule add \
+    priority "$priority" \
     from "$source" \
-    table "$TABLE_ID" \
-    priority "$priority"
+    lookup "$TABLE_ID"
+
   priority=$((priority + 1))
 done
 
-nft add table ip ruter_nat
-nft 'add chain ip ruter_nat postrouting { type nat hook postrouting priority 100; policy accept; }'
-nft add rule ip ruter_nat postrouting \
-  oifname "$LAN_IFACE" \
-  ip saddr "$LAN_CIDR" \
-  masquerade
+nft -f - <<NFT_EOF
+add table ip ruter_nat
+add chain ip ruter_nat postrouting { type nat hook postrouting priority srcnat; policy accept; }
+add rule ip ruter_nat postrouting oifname "$LAN_IFACE" ip saddr "$LAN_CIDR" masquerade
+NFT_EOF
 
 echo "Ruter policy routing applied"
 ROUTE_EOF
 
   chmod 0755 "$ROUTE_SCRIPT"
+  bash -n "$ROUTE_SCRIPT"
 
   cat >"$ROUTE_SERVICE" <<EOF
 [Unit]
@@ -838,8 +944,6 @@ Type=oneshot
 ExecStartPre=/bin/sleep 3
 ExecStart=$ROUTE_SCRIPT
 RemainAfterExit=yes
-Restart=on-failure
-RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -868,7 +972,13 @@ restart_singbox() {
 restart_routing() {
   load_settings
   write_route_script
-  systemctl restart ruter-route.service
+
+  if ! systemctl restart ruter-route.service; then
+    fail "Маршрутизация не запустилась."
+    journalctl -u ruter-route.service -n 40 --no-pager >&2 || true
+    return 1
+  fi
+
   systemctl is-active --quiet ruter-route.service
   ok "Маршрутизация перезапущена."
 }
@@ -884,14 +994,12 @@ update_subscription() {
   load_settings
   read_subscription_input
   generate_singbox_config
-  write_route_script
   restart_all
 }
 
 regenerate_from_saved_subscription() {
   load_settings
   generate_singbox_config
-  write_route_script
   restart_all
 }
 
