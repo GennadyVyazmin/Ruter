@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Universal sing-box policy-routing gateway manager.
 # Clean Ruter installation layout.
 
-RUTER_VERSION="2.0.1"
+RUTER_VERSION="2.0.2"
 
 APP_DIR="/etc/ruter"
 SETTINGS_FILE="$APP_DIR/settings.env"
@@ -920,11 +920,12 @@ for source in $ROUTE_SOURCES; do
   priority=$((priority + 1))
 done
 
-nft -f - <<NFT_EOF
-add table ip ruter_nat
-add chain ip ruter_nat postrouting { type nat hook postrouting priority srcnat; policy accept; }
-add rule ip ruter_nat postrouting oifname "$LAN_IFACE" ip saddr "$LAN_CIDR" masquerade
-NFT_EOF
+nft add table ip ruter_nat
+nft 'add chain ip ruter_nat postrouting { type nat hook postrouting priority srcnat; policy accept; }'
+nft add rule ip ruter_nat postrouting \
+  oifname "$LAN_IFACE" \
+  ip saddr "$LAN_CIDR" \
+  masquerade
 
 echo "Ruter policy routing applied"
 ROUTE_EOF
@@ -1222,7 +1223,6 @@ install_flow() {
 
   generate_singbox_config
   reset_runtime_state
-  write_route_script
   restart_all
 
   show_status
@@ -1237,7 +1237,6 @@ repair_flow() {
   install_singbox
   install_ui
   generate_singbox_config
-  write_route_script
   restart_all
   ok "Установка восстановлена."
 }
