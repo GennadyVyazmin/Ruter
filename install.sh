@@ -4,8 +4,11 @@ set -Eeuo pipefail
 # Ruter Gateway
 # Universal sing-box policy-routing gateway manager.
 # Clean Ruter installation layout.
+# Installs required packages automatically, including curl.
+# Provides a local mixed proxy and a LAN mixed proxy for services such as
+# Prowlarr/FlareSolverr to use the same sing-box selector managed by MetaCubeXD.
 
-RUTER_VERSION="2.0.2"
+RUTER_VERSION="2.1.0"
 
 APP_DIR="/etc/ruter"
 SETTINGS_FILE="$APP_DIR/settings.env"
@@ -30,6 +33,7 @@ DEFAULT_RULE_PRIORITY="100"
 DEFAULT_SELF_RULE_PRIORITY="90"
 DEFAULT_TUN_IFACE="sb-tun0"
 DEFAULT_MIXED_PORT="2080"
+DEFAULT_LAN_PROXY_PORT="2081"
 DEFAULT_CLASH_PORT="9090"
 
 C_RESET=$'\033[0m'
@@ -78,6 +82,7 @@ load_settings() {
   SELF_RULE_PRIORITY="${SELF_RULE_PRIORITY:-$DEFAULT_SELF_RULE_PRIORITY}"
   TUN_IFACE="${TUN_IFACE:-$DEFAULT_TUN_IFACE}"
   MIXED_PORT="${MIXED_PORT:-$DEFAULT_MIXED_PORT}"
+  LAN_PROXY_PORT="${LAN_PROXY_PORT:-$DEFAULT_LAN_PROXY_PORT}"
   CLASH_PORT="${CLASH_PORT:-$DEFAULT_CLASH_PORT}"
 
   # Migration from v1.
@@ -244,6 +249,7 @@ SELF_RULE_PRIORITY="${SELF_RULE_PRIORITY:-$DEFAULT_SELF_RULE_PRIORITY}"
 
 TUN_IFACE="${TUN_IFACE:-$DEFAULT_TUN_IFACE}"
 MIXED_PORT="${MIXED_PORT:-$DEFAULT_MIXED_PORT}"
+LAN_PROXY_PORT="${LAN_PROXY_PORT:-$DEFAULT_LAN_PROXY_PORT}"
 CLASH_PORT="${CLASH_PORT:-$DEFAULT_CLASH_PORT}"
 EOF
 
@@ -355,7 +361,7 @@ generate_singbox_config() {
   local candidate
   candidate="$(mktemp)"
 
-  python3 - "$SUB_FILE" "$candidate" "$UI_DIR" "$TUN_IFACE" "$MIXED_PORT" "$CLASH_PORT" <<'PY'
+  python3 - "$SUB_FILE" "$candidate" "$UI_DIR" "$TUN_IFACE" "$MIXED_PORT" "$CLASH_PORT" "$VM_IP" "$LAN_PROXY_PORT" <<'PY'
 import base64
 import ipaddress
 import json
@@ -365,9 +371,10 @@ import sys
 import urllib.parse
 import urllib.request
 
-sub_file, out_file, ui_dir, tun_iface, mixed_port, clash_port = sys.argv[1:]
+sub_file, out_file, ui_dir, tun_iface, mixed_port, clash_port, vm_ip, lan_proxy_port = sys.argv[1:]
 mixed_port = int(mixed_port)
 clash_port = int(clash_port)
+lan_proxy_port = int(lan_proxy_port)
 
 raw = open(sub_file, "r", encoding="utf-8", errors="ignore").read().strip()
 
@@ -637,6 +644,12 @@ config = {
             "tag": "mixed-in",
             "listen": "127.0.0.1",
             "listen_port": mixed_port,
+        },
+        {
+            "type": "mixed",
+            "tag": "lan-proxy-in",
+            "listen": vm_ip,
+            "listen_port": lan_proxy_port,
         },
     ],
     "outbounds": outbounds,
@@ -1059,6 +1072,8 @@ show_status() {
     echo "VM:            $VM_IP"
     echo "LAN:           $LAN_CIDR"
     echo "Маршруты:      ${ROUTE_SOURCES:-отключены}"
+    echo "Local proxy:   127.0.0.1:$MIXED_PORT (mixed HTTP/SOCKS)"
+    echo "LAN proxy:     $VM_IP:$LAN_PROXY_PORT (mixed HTTP/SOCKS)"
     echo "Clash UI:      http://$VM_IP:$CLASH_PORT/ui"
   fi
 
@@ -1120,12 +1135,29 @@ doctor() {
     if curl -4fsS --max-time 15 \
       -x "socks5h://127.0.0.1:$MIXED_PORT" \
       https://ifconfig.me >/tmp/ruter-ip.$$ 2>/dev/null; then
-      ok "Mixed/SOCKS-прокси работает: $(cat /tmp/ruter-ip.$$)"
+      ok "Local mixed/SOCKS-прокси работает: $(cat /tmp/ruter-ip.$$)"
     else
-      fail "Mixed/SOCKS-прокси не отвечает"
+      fail "Local mixed/SOCKS-прокси не отвечает"
       errors=$((errors+1))
     fi
     rm -f /tmp/ruter-ip.$$
+
+    if ss -lnt | grep -Eq "[[:space:]]${VM_IP}:${LAN_PROXY_PORT}[[:space:]]"; then
+      ok "LAN proxy слушает $VM_IP:$LAN_PROXY_PORT"
+    else
+      fail "LAN proxy не слушает $VM_IP:$LAN_PROXY_PORT"
+      errors=$((errors+1))
+    fi
+
+    if curl -4fsS --max-time 15 \
+      -x "http://$VM_IP:$LAN_PROXY_PORT" \
+      https://ifconfig.me >/tmp/ruter-lan-ip.$$ 2>/dev/null; then
+      ok "LAN HTTP-прокси работает: $(cat /tmp/ruter-lan-ip.$$)"
+    else
+      fail "LAN HTTP-прокси не отвечает"
+      errors=$((errors+1))
+    fi
+    rm -f /tmp/ruter-lan-ip.$$
   fi
 
   reality_errors="$(journalctl -u sing-box --since '-30 min' --no-pager 2>/dev/null |
@@ -1202,6 +1234,7 @@ install_flow() {
   SELF_RULE_PRIORITY="$DEFAULT_SELF_RULE_PRIORITY"
   TUN_IFACE="$DEFAULT_TUN_IFACE"
   MIXED_PORT="$DEFAULT_MIXED_PORT"
+  LAN_PROXY_PORT="$DEFAULT_LAN_PROXY_PORT"
   CLASH_PORT="$DEFAULT_CLASH_PORT"
 
   ask_route_mode
@@ -1384,6 +1417,14 @@ main_menu() {
 usage() {
   cat <<EOF
 Ruter $RUTER_VERSION
+
+Установка автоматически ставит зависимости:
+  curl, wget, ca-certificates, iproute2, nftables, python3, git, unzip, jq
+
+После установки доступны:
+  local mixed proxy: 127.0.0.1:$DEFAULT_MIXED_PORT
+  LAN mixed proxy:   <IP Ruter>:$DEFAULT_LAN_PROXY_PORT
+  LAN proxy использует тот же selector/auto, что и MetaCubeXD.
 
 Использование:
   ruter                       интерактивное меню
