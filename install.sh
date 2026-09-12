@@ -8,7 +8,7 @@ set -Eeuo pipefail
 # Provides a local mixed proxy and a LAN mixed proxy for services such as
 # Prowlarr/FlareSolverr to use the same sing-box selector managed by MetaCubeXD.
 
-RUTER_VERSION="2.1.0"
+RUTER_VERSION="2.1.1"
 
 APP_DIR="/etc/ruter"
 SETTINGS_FILE="$APP_DIR/settings.env"
@@ -314,14 +314,25 @@ install_singbox() {
 install_ui() {
   mkdir -p "$SINGBOX_DIR"
 
-  if [ -d "$UI_DIR/.git" ]; then
-    git -C "$UI_DIR" pull --ff-only
-    ok "MetaCubeXD обновлён."
-    return
+  rm -rf "$UI_DIR"
+
+  if ! git clone \
+    --depth 1 \
+    --single-branch \
+    --branch gh-pages \
+    https://github.com/MetaCubeX/metacubexd.git \
+    "$UI_DIR"; then
+    rm -rf "$UI_DIR"
+    fail "Не удалось установить MetaCubeXD."
+    return 1
   fi
 
-  rm -rf "$UI_DIR"
-  git clone https://github.com/MetaCubeX/metacubexd.git -b gh-pages "$UI_DIR"
+  if [ ! -f "$UI_DIR/index.html" ]; then
+    rm -rf "$UI_DIR"
+    fail "MetaCubeXD установлен некорректно: не найден $UI_DIR/index.html"
+    return 1
+  fi
+
   ok "MetaCubeXD установлен."
 }
 
