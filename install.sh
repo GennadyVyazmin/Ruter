@@ -8,7 +8,7 @@ set -Eeuo pipefail
 # Provides a local mixed proxy and a LAN mixed proxy for services such as
 # Prowlarr/FlareSolverr to use the same sing-box selector managed by MetaCubeXD.
 
-RUTER_VERSION="2.1.1"
+RUTER_VERSION="2.1.2"
 
 APP_DIR="/etc/ruter"
 SETTINGS_FILE="$APP_DIR/settings.env"
@@ -960,8 +960,8 @@ ROUTE_EOF
   cat >"$ROUTE_SERVICE" <<EOF
 [Unit]
 Description=Ruter policy routing
-After=network-online.target sing-box.service
-Wants=network-online.target
+After=network-online.target nftables.service sing-box.service
+Wants=network-online.target nftables.service
 Requires=sing-box.service
 
 [Service]
@@ -1215,7 +1215,7 @@ update_manager() {
   tmp="$(mktemp)"
   backup="$MANAGER_PATH.backup-$(date +%Y%m%d-%H%M%S)"
 
-  info "Скачиваю новую версию управляющего скрипта..."
+  info "Скачиваю новую версию Ruter с GitHub..."
   curl -fsSL "$REPO_RAW_URL" -o "$tmp"
   chmod 0755 "$tmp"
 
@@ -1234,8 +1234,9 @@ update_manager() {
   ln -sfn "$MANAGER_PATH" "$COMMAND_PATH"
   rm -f "$tmp"
 
-  ok "Ruter обновлён."
+  ok "Ruter обновлён с GitHub."
   [ -f "$backup" ] && echo "Резервная копия: $backup"
+  echo "Чтобы применить изменения служб: sudo ruter restart-route"
 }
 
 install_flow() {
@@ -1362,7 +1363,7 @@ updates_menu() {
   while true; do
     echo
     echo "Обновления"
-    echo "  1) Обновить Ruter"
+    echo "  1) Обновить Ruter с GitHub"
     echo "  2) Обновить sing-box"
     echo "  3) Обновить MetaCubeXD"
     echo "  4) Обновить конфигурацию из сохранённой подписки"
@@ -1448,7 +1449,7 @@ Ruter $RUTER_VERSION
   ruter route                 изменить тип маршрутизации
   ruter sub                   заменить подписку и применить
   ruter rebuild               пересоздать config из сохранённой подписки
-  ruter update                обновить управляющий скрипт
+  ruter update                обновить Ruter с GitHub
   ruter update-singbox        обновить sing-box
   ruter update-ui             обновить MetaCubeXD
   ruter uninstall             удалить
